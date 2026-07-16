@@ -1,0 +1,559 @@
+"""
+Snapshrink - engine core (Phase 1) + batch runner (Phase 2)
+=====================================================
+Pure-Python core. No GUI, no hooks, no registry. Windows/Mac/Linux.
+Originals are NEVER touched - every run creates a new file.
+
+Output naming:
+    photo.png --target-px 1920 --target-kb 250  ->  photo_1920-248KB.jpg
+    photo.png --target-kb 250                   ->  photo_248KB.jpg
+    photo.png --target-px 1920                  ->  photo_1920.jpg
+    photo.png (plain convert)                   ->  photo.jpg
+    (name already taken?                        ->  ...-1.jpg, ...-2.jpg)
+    Pixel number = actual longest edge of the result.
+    KB number    = actual final file size (truth in the filename).
+
+Usage (terminal):
+    python snapshrink.py photo.png                       -> photo.jpg (q95)
+    python snapshrink.py *.png --format webp             -> WebP versions
+    python snapshrink.py img.jpg --target-kb 200         -> under 200 KB
+    python snapshrink.py img.jpg --target-px 1920        -> longest edge 1920px
+    python snapshrink.py folder/*.jpg --target-kb 150 --strip-exif
+    python snapshrink.py --selftest                      -> built-in test suite
+
+Requires:  pip install pillow
+Optional:  pip install pillow-heif   (adds iPhone .heic input support)
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import io
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from PIL import Image, ImageOps
+
+# Optional HEIC support (iPhone photos). Silently skipped if not installed.
+try:
+    from pillow_heif import register_heif_opener  # type: ignore
+    register_heif_opener()
+    HEIC_SUPPORT = True
+except ImportError:
+    HEIC_SUPPORT = False
+
+# ----------------------------------------------------------------------------
+# Configuration / constants
+# ----------------------------------------------------------------------------
+
+SUPPORTED_INPUT_EXT = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico",
+}
+if HEIC_SUPPORT:
+    SUPPORTED_INPUT_EXT |= {".heic", ".heif"}
+
+OUTPUT_FORMATS = {
+    # name        pillow-format  extension  supports-alpha
+    "jpg":  ("JPEG", ".jpg",  False),
+    "png":  ("PNG",  ".png",  True),
+    "webp": ("WEBP", ".webp", True),
+}
+
+MAX_QUALITY = 95          # "100" in Pillow bloats files; 95 is visually identical
+MIN_QUALITY = 60          # hard floor per the blueprint
+DOWNSCALE_STEP = 0.90     # shrink dimensions 10% per pass when quality floor hit
+MIN_DIMENSION = 64        # give up shrinking below this (safety stop)
+FLATTEN_BG = (255, 255, 255)  # white background when alpha is dropped for JPEG
+
+
+# ----------------------------------------------------------------------------
+# Options and result objects
+# ----------------------------------------------------------------------------
+
+@dataclass
+class Options:
+    """Everything the engine needs to know. The GUI (Phase 3) will build
+    one of these from its widgets; the CLI builds it from argparse."""
+    out_format: str = "jpg"        # "jpg" | "png" | "webp"
+    quality: int = MAX_QUALITY     # starting quality for lossy formats
+    target_kb: int | None = None   # e.g. 200 -> file must be <= 200 KB
+    target_px: int | None = None   # e.g. 1920 -> longest edge <= 1920
+    strip_exif: bool = False       # drop metadata (privacy + size)
+    output_dir: str | None = None  # None = same folder as source
+
+
+@dataclass
+class Result:
+    """What happened to one file. The batch runner collects these."""
+    source: str
+    ok: bool
+    output: str | None = None
+    error: str | None = None
+    in_bytes: int = 0
+    out_bytes: int = 0
+    final_quality: int | None = None
+    final_size: tuple[int, int] | None = None
+    seconds: float = 0.0
+
+    def summary(self) -> str:
+        if not self.ok:
+            return f"FAIL  {Path(self.source).name}: {self.error}"
+        saved = (1 - self.out_bytes / self.in_bytes) * 100 if self.in_bytes else 0
+        q = f" q{self.final_quality}" if self.final_quality else ""
+        dims = f" {self.final_size[0]}x{self.final_size[1]}" if self.final_size else ""
+        return (f"OK    {Path(self.source).name} -> {Path(self.output).name}  "
+                f"{self.in_bytes/1024:.0f}KB -> {self.out_bytes/1024:.0f}KB "
+                f"({saved:+.0f}%){q}{dims}")
+
+
+# ----------------------------------------------------------------------------
+# Engine internals (all in-memory, no temp files)
+# ----------------------------------------------------------------------------
+
+def _load_image(path: Path) -> Image.Image:
+    """Open image, apply EXIF rotation, normalize color mode."""
+    img = Image.open(path)
+    img.load()  # force decode now so corrupt files fail here, loudly
+
+    # Respect the EXIF Orientation tag (phone photos are often "sideways"
+    # on disk and rely on this tag). Bake the rotation into the pixels.
+    img = ImageOps.exif_transpose(img)
+
+    # Normalize exotic modes (CMYK from print scans, palette GIF/PNG, 16-bit)
+    if img.mode in ("CMYK", "YCbCr"):
+        img = img.convert("RGB")
+    elif img.mode == "P":
+        img = img.convert("RGBA" if "transparency" in img.info else "RGB")
+    elif img.mode in ("I", "I;16", "F"):
+        img = img.convert("L")
+    return img
+
+
+def _prepare_for_format(img: Image.Image, fmt: str) -> Image.Image:
+    """Flatten transparency onto white if the target format can't hold alpha."""
+    _, _, supports_alpha = OUTPUT_FORMATS[fmt]
+    has_alpha = img.mode in ("RGBA", "LA")
+    if has_alpha and not supports_alpha:
+        bg = Image.new("RGB", img.size, FLATTEN_BG)
+        bg.paste(img, mask=img.getchannel("A"))
+        return bg
+    if not supports_alpha and img.mode not in ("RGB", "L"):
+        return img.convert("RGB")
+    return img
+
+
+def _encode(img: Image.Image, fmt: str, quality: int, keep_exif: bytes | None) -> bytes:
+    """Encode to an in-memory buffer, return the raw bytes."""
+    pillow_fmt, _, _ = OUTPUT_FORMATS[fmt]
+    buf = io.BytesIO()
+    kwargs: dict = {}
+    if pillow_fmt == "JPEG":
+        kwargs = {"quality": quality, "optimize": True, "progressive": True}
+    elif pillow_fmt == "WEBP":
+        kwargs = {"quality": quality, "method": 4}
+    elif pillow_fmt == "PNG":
+        kwargs = {"optimize": True}
+    if keep_exif:
+        kwargs["exif"] = keep_exif
+    img.save(buf, pillow_fmt, **kwargs)
+    return buf.getvalue()
+
+
+def _scale_to_longest_edge(img: Image.Image, target_px: int) -> Image.Image:
+    """Aspect-ratio-locked resize so the longest edge == target_px.
+    Never upscales."""
+    w, h = img.size
+    longest = max(w, h)
+    if longest <= target_px:
+        return img
+    ratio = target_px / longest
+    new_size = (max(1, round(w * ratio)), max(1, round(h * ratio)))
+    return img.resize(new_size, Image.LANCZOS)
+
+
+def _fit_to_kb(img: Image.Image, fmt: str, start_quality: int,
+               target_kb: int, keep_exif: bytes | None) -> tuple[bytes, int, Image.Image]:
+    """The KB-target loop.
+    1. Binary-search quality between MIN_QUALITY..start_quality  (4-5 encodes,
+       much faster than stepping down 5% at a time).
+    2. If even MIN_QUALITY is too big, downscale dimensions 10% and repeat.
+    Returns (bytes, final_quality, final_image)."""
+    target_bytes = target_kb * 1024
+
+    while True:
+        # -- binary search on quality --------------------------------------
+        lo, hi = MIN_QUALITY, start_quality
+        best: bytes | None = None
+        best_q = MIN_QUALITY
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            data = _encode(img, fmt, mid, keep_exif)
+            if len(data) <= target_bytes:
+                best, best_q = data, mid   # fits -> try higher quality
+                lo = mid + 1
+            else:
+                hi = mid - 1               # too big -> try lower quality
+        if best is not None:
+            return best, best_q, img
+
+        # -- quality floor reached, still too big: shrink pixels -----------
+        w, h = img.size
+        if max(w, h) <= MIN_DIMENSION:
+            # Can't shrink further; return the smallest we can make.
+            data = _encode(img, fmt, MIN_QUALITY, keep_exif)
+            return data, MIN_QUALITY, img
+        img = img.resize(
+            (max(1, round(w * DOWNSCALE_STEP)), max(1, round(h * DOWNSCALE_STEP))),
+            Image.LANCZOS,
+        )
+
+
+def _output_path(src: Path, opts: Options, final_size: tuple[int, int],
+                 out_bytes: int) -> Path:
+    """Snapshrink naming scheme. Originals are never overwritten.
+        px + kb targets : photo_1920-248KB.jpg
+        kb only         : photo_248KB.jpg
+        px only         : photo_1920.jpg
+        plain convert   : photo.jpg
+        collision       : ...-1.jpg, ...-2.jpg
+    Pixel number = actual longest edge; KB = actual final size (floor)."""
+    _, ext, _ = OUTPUT_FORMATS[opts.out_format]
+    folder = Path(opts.output_dir) if opts.output_dir else src.parent
+    folder.mkdir(parents=True, exist_ok=True)
+
+    parts = []
+    if opts.target_px:
+        parts.append(str(max(final_size)))
+    if opts.target_kb:
+        parts.append(f"{out_bytes // 1024}KB")
+    suffix = ("_" + "-".join(parts)) if parts else ""
+
+    candidate = folder / f"{src.stem}{suffix}{ext}"
+    n = 1
+    while candidate.exists():
+        candidate = folder / f"{src.stem}{suffix}-{n}{ext}"
+        n += 1
+    return candidate
+
+
+# ----------------------------------------------------------------------------
+# Public engine entry point  (this is THE function - GUI and hotkey daemon
+# will call exactly this, nothing else)
+# ----------------------------------------------------------------------------
+
+def process_image(path: str | Path, opts: Options) -> Result:
+    t0 = time.perf_counter()
+    src = Path(path)
+    res = Result(source=str(src), ok=False)
+
+    try:
+        if not src.is_file():
+            raise FileNotFoundError("file does not exist")
+        if src.suffix.lower() not in SUPPORTED_INPUT_EXT:
+            raise ValueError(f"unsupported file type '{src.suffix}'")
+        res.in_bytes = src.stat().st_size
+
+        img = _load_image(src)
+
+        # Keep original EXIF only if user did NOT ask to strip it
+        keep_exif = None
+        if not opts.strip_exif:
+            keep_exif = img.info.get("exif")  # may be None; that's fine
+
+        # Dimension limit first (cheap), then format prep, then encode
+        if opts.target_px:
+            img = _scale_to_longest_edge(img, opts.target_px)
+        img = _prepare_for_format(img, opts.out_format)
+
+        if opts.target_kb:
+            data, q, img = _fit_to_kb(img, opts.out_format, opts.quality,
+                                      opts.target_kb, keep_exif)
+        else:
+            q = opts.quality
+            data = _encode(img, opts.out_format, q, keep_exif)
+
+        out = _output_path(src, opts, img.size, len(data))
+        out.write_bytes(data)
+
+        res.ok = True
+        res.output = str(out)
+        res.out_bytes = len(data)
+        res.final_quality = q if opts.out_format != "png" else None
+        res.final_size = img.size
+
+    except Exception as e:  # one bad file must never kill the batch
+        res.error = f"{type(e).__name__}: {e}"
+
+    res.seconds = time.perf_counter() - t0
+    return res
+
+
+# ----------------------------------------------------------------------------
+# Phase 2: batch runner (thread pool + live console progress)
+# ----------------------------------------------------------------------------
+
+def process_batch(paths: list[str], opts: Options,
+                  progress=None) -> list[Result]:
+    """Run the engine over many files concurrently.
+    `progress(done, total, result)` is called after each file (any thread)."""
+    results: list[Result] = []
+    total = len(paths)
+    workers = min(8, max(2, os.cpu_count() or 4))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(process_image, p, opts): p for p in paths}
+        done = 0
+        for fut in concurrent.futures.as_completed(futures):
+            r = fut.result()
+            results.append(r)
+            done += 1
+            if progress:
+                progress(done, total, r)
+    return results
+
+
+def _cli_progress(done: int, total: int, r: Result) -> None:
+    print(f"[{done}/{total}] {r.summary()}")
+
+
+# ----------------------------------------------------------------------------
+# Built-in self test  (python snapshrink.py --selftest)
+# ----------------------------------------------------------------------------
+
+def _selftest() -> int:
+    import tempfile
+    from PIL import ImageDraw
+
+    print("Running self-test...\n")
+    tmp = Path(tempfile.mkdtemp(prefix="imgopt_test_"))
+    failures = 0
+
+    def check(name: str, cond: bool, detail: str = ""):
+        nonlocal failures
+        mark = "PASS" if cond else "FAIL"
+        if not cond:
+            failures += 1
+        print(f"  [{mark}] {name}" + (f"  ({detail})" if detail else ""))
+
+    # --- create test fixtures in memory-backed temp dir ---------------------
+    def make(name: str, mode: str, size, fmt: str, **save_kw) -> Path:
+        img = Image.new(mode, size,
+                        (200, 60, 60, 128) if "A" in mode else (200, 60, 60))
+        d = ImageDraw.Draw(img)
+        for i in range(0, size[0], 17):  # noise so JPEG can't over-compress
+            d.line([(i, 0), (0, i)], fill=(i % 255, 255 - i % 255, 120), width=2)
+        p = tmp / name
+        img.save(p, fmt, **save_kw)
+        return p
+
+    png_alpha = make("alpha.png", "RGBA", (800, 600), "PNG")
+    big_jpg   = make("big.jpg", "RGB", (3000, 2000), "JPEG", quality=95)
+    cmyk_jpg  = make("cmyk.jpg", "CMYK", (500, 500), "JPEG")
+    tall_png  = make("tall portrait ünïcode.png", "RGB", (600, 2400), "PNG")
+    corrupt   = tmp / "corrupt.jpg"
+    corrupt.write_bytes(b"\xff\xd8\xff\xe0 this is not a real jpeg")
+    textfile  = tmp / "notes.txt"
+    textfile.write_text("hello")
+
+    # --- 1. simple conversion PNG->JPG (alpha flattening) -------------------
+    r = process_image(png_alpha, Options(out_format="jpg"))
+    check("PNG(alpha) -> JPG converts", r.ok, r.error or "")
+    check("output is .jpg in same folder",
+          r.ok and r.output.endswith("alpha.jpg") and Path(r.output).parent == tmp)
+    if r.ok:
+        check("JPG has no alpha", Image.open(r.output).mode == "RGB")
+
+    # --- 2. collision handling ----------------------------------------------
+    r2 = process_image(png_alpha, Options(out_format="jpg"))
+    check("collision -> alpha-1.jpg, no overwrite",
+          r2.ok and Path(r2.output).name == "alpha-1.jpg", r2.output or "")
+    r3 = process_image(png_alpha, Options(out_format="jpg"))
+    check("second collision -> alpha-2.jpg",
+          r3.ok and Path(r3.output).name == "alpha-2.jpg", r3.output or "")
+
+    # --- 3. KB target loop ----------------------------------------------------
+    r = process_image(big_jpg, Options(out_format="jpg", target_kb=150))
+    check("KB target: succeeds", r.ok, r.error or "")
+    if r.ok:
+        check("KB target: result <= 150KB", r.out_bytes <= 150 * 1024,
+              f"{r.out_bytes/1024:.0f}KB")
+        check("KB target: quality within 60..95",
+              MIN_QUALITY <= r.final_quality <= MAX_QUALITY,
+              f"q{r.final_quality}")
+        check("KB target: name is big_<size>KB.jpg",
+              Path(r.output).name == f"big_{r.out_bytes // 1024}KB.jpg",
+              Path(r.output).name)
+
+    # --- 4. impossible-ish KB target triggers downscaling ---------------------
+    r = process_image(big_jpg, Options(out_format="jpg", target_kb=15))
+    check("tiny KB target: still succeeds via downscale", r.ok, r.error or "")
+    if r.ok:
+        check("tiny KB target: dimensions were reduced",
+              max(r.final_size) < 3000, f"{r.final_size}")
+
+    # --- 5. PX target, aspect ratio locked ------------------------------------
+    r = process_image(tall_png, Options(out_format="jpg", target_px=1000))
+    check("PX target on unicode filename", r.ok, r.error or "")
+    if r.ok:
+        w, h = r.final_size
+        check("PX target: longest edge == 1000", max(w, h) == 1000, f"{w}x{h}")
+        check("PX target: aspect ratio kept", abs(w / h - 600 / 2400) < 0.01)
+        check("PX target: name ends _1000.jpg",
+              Path(r.output).name.endswith("_1000.jpg"), Path(r.output).name)
+
+    # --- 6. no upscale ---------------------------------------------------------
+    r = process_image(png_alpha, Options(out_format="jpg", target_px=5000))
+    check("PX target larger than image: no upscale",
+          r.ok and r.final_size == (800, 600), str(r.final_size))
+
+    # --- 7. CMYK input ---------------------------------------------------------
+    r = process_image(cmyk_jpg, Options(out_format="jpg"))
+    check("CMYK JPEG input handled", r.ok, r.error or "")
+
+    # --- 8. WebP output --------------------------------------------------------
+    r = process_image(big_jpg, Options(out_format="webp", target_kb=100))
+    check("WebP with KB target", r.ok and r.out_bytes <= 100 * 1024,
+          r.error or f"{r.out_bytes/1024:.0f}KB")
+
+    # --- 8b. Combined PX + KB target naming: photo_1920-248KB.jpg style -------
+    r = process_image(big_jpg, Options(out_format="jpg", target_px=1920,
+                                       target_kb=200))
+    if r.ok:
+        expected = f"big_{max(r.final_size)}-{r.out_bytes // 1024}KB.jpg"
+        check("PX+KB naming: big_<px>-<kb>KB.jpg",
+              Path(r.output).name == expected, Path(r.output).name)
+        check("PX+KB: both constraints met",
+              max(r.final_size) <= 1920 and r.out_bytes <= 200 * 1024)
+    else:
+        check("PX+KB target run", False, r.error or "")
+
+    # --- 9. EXIF stripping -----------------------------------------------------
+    exif_src = tmp / "with_exif.jpg"
+    im = Image.new("RGB", (300, 300), (10, 120, 200))
+    from PIL import Image as _I
+    exif = _I.Exif()
+    exif[0x010F] = "TestCam Corp"       # Make
+    exif[0x0110] = "SuperPhone 9000"    # Model
+    im.save(exif_src, "JPEG", exif=exif)
+    r = process_image(exif_src, Options(out_format="jpg", strip_exif=True))
+    if r.ok:
+        out_exif = Image.open(r.output).getexif()
+        check("EXIF stripped", len(out_exif) == 0, f"{len(out_exif)} tags left")
+    r = process_image(exif_src, Options(out_format="jpg", strip_exif=False))
+    if r.ok:
+        out_exif = Image.open(r.output).getexif()
+        check("EXIF preserved when not stripping",
+              out_exif.get(0x010F) == "TestCam Corp")
+
+    # --- 10. failures don't crash ----------------------------------------------
+    r = process_image(corrupt, Options())
+    check("corrupt file -> clean error", not r.ok and r.error is not None,
+          r.error or "")
+    r = process_image(textfile, Options())
+    check("non-image file -> clean error", not r.ok)
+    r = process_image(tmp / "ghost.png", Options())
+    check("missing file -> clean error", not r.ok)
+
+    # --- 11. source is NEVER touched (jpg -> jpg plain convert) -----------------
+    same_src = make("same_name.jpg", "RGB", (400, 400), "JPEG", quality=95)
+    original_bytes = same_src.read_bytes()
+    r = process_image(same_src, Options(out_format="jpg"))
+    check("jpg->jpg: output goes to same_name-1.jpg",
+          r.ok and Path(r.output).name == "same_name-1.jpg", r.error or "")
+    check("jpg->jpg: original file byte-identical",
+          same_src.read_bytes() == original_bytes)
+
+    # --- 12. batch runner ---------------------------------------------------------
+    batch_files = [str(png_alpha), str(big_jpg), str(corrupt), str(cmyk_jpg)]
+    results = process_batch(batch_files, Options(out_format="jpg",
+                                                 target_kb=200))
+    check("batch: all files reported", len(results) == 4)
+    check("batch: 3 ok + 1 fail",
+          sum(r.ok for r in results) == 3 and sum(not r.ok for r in results) == 1)
+
+    print(f"\nTest files are in: {tmp}")
+    print("Self-test " + ("PASSED - all good!" if failures == 0
+                          else f"FAILED ({failures} problem(s) above)"))
+    return 1 if failures else 0
+
+
+# ----------------------------------------------------------------------------
+# CLI (Phase 2) - this also simulates the future right-click context menu,
+# because the context menu just launches:  optimizer.exe "file1" "file2" ...
+# ----------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="snapshrink",
+        description="Snapshrink - convert & compress images fast. Originals are never modified.",
+    )
+    ap.add_argument("files", nargs="*", help="image file(s) to process")
+    ap.add_argument("--format", choices=list(OUTPUT_FORMATS), default="jpg",
+                    dest="out_format", help="output format (default: jpg)")
+    ap.add_argument("--quality", type=int, default=MAX_QUALITY,
+                    help=f"starting quality 60-95 (default {MAX_QUALITY})")
+    ap.add_argument("--target-kb", type=int, default=None,
+                    help="shrink until file is under this many KB")
+    ap.add_argument("--target-px", type=int, default=None,
+                    help="shrink longest edge to this many pixels")
+    ap.add_argument("--strip-exif", action="store_true",
+                    help="remove EXIF metadata (camera, GPS, timestamps)")
+    ap.add_argument("--output-dir", default=None,
+                    help="write results here instead of the source folder")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run the built-in test suite and exit")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return _selftest()
+
+    if not args.files:
+        ap.print_help()
+        print("\n(Tip: run  python snapshrink.py --selftest  to verify everything works.)")
+        return 0
+
+    # Expand wildcards manually (Windows cmd doesn't expand * for you)
+    import glob
+    paths: list[str] = []
+    for f in args.files:
+        matches = glob.glob(f)
+        paths.extend(matches if matches else [f])
+
+    if not (MIN_QUALITY <= args.quality <= MAX_QUALITY):
+        print(f"quality must be between {MIN_QUALITY} and {MAX_QUALITY}")
+        return 2
+
+    opts = Options(
+        out_format=args.out_format,
+        quality=args.quality,
+        target_kb=args.target_kb,
+        target_px=args.target_px,
+        strip_exif=args.strip_exif,
+        output_dir=args.output_dir,
+    )
+
+    t0 = time.perf_counter()
+    print(f"Processing {len(paths)} file(s) -> {args.out_format.upper()}"
+          + (f", target {args.target_kb}KB" if args.target_kb else "")
+          + (f", max edge {args.target_px}px" if args.target_px else "")
+          + (", EXIF stripped" if args.strip_exif else "") + "\n")
+
+    results = process_batch(paths, opts, progress=_cli_progress)
+
+    ok = [r for r in results if r.ok]
+    bad = [r for r in results if not r.ok]
+    total_in = sum(r.in_bytes for r in ok)
+    total_out = sum(r.out_bytes for r in ok)
+    print(f"\nDone in {time.perf_counter()-t0:.2f}s: "
+          f"{len(ok)} succeeded, {len(bad)} failed.")
+    if ok and total_in:
+        print(f"Total size: {total_in/1024:.0f}KB -> {total_out/1024:.0f}KB "
+              f"({(1-total_out/total_in)*100:.0f}% saved)")
+    return 0 if not bad else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

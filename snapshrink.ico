@@ -1,0 +1,473 @@
+"""
+Snapshrink - Phase 3: the window.
+
+Two ways it opens (same window either way):
+  * with files  -> right-click / drag-onto-icon: queue is pre-filled, ready to hit Convert
+  * with no files -> desktop shortcut: opens as an empty drop zone
+
+Everything heavy (customtkinter, tkinterdnd2) is imported INSIDE this module,
+which is only imported when a window is actually needed. The background daemon
+never touches any of it - that's what keeps idle RAM/CPU near zero.
+
+---------------------------------------------------------------------------
+THEME (v1.26): modern white / glassmorphic look, replacing the default
+CustomTkinter "system" grey. Colors are centralized in the COLOR dict below -
+change a value there and it updates everywhere it's used.
+---------------------------------------------------------------------------
+"""
+
+from __future__ import annotations
+
+import queue
+import threading
+from pathlib import Path
+
+import customtkinter as ctk
+
+from . import config as cfgmod
+from .engine import OUTPUT_FORMATS, SUPPORTED_INPUT_EXT, Options, process_batch
+
+# --- drag & drop is optional: app still works without it -------------------
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_OK = True
+except Exception:
+    DND_OK = False
+
+ctk.set_appearance_mode("light")      # force light mode - this theme is white-first
+ctk.set_default_color_theme("blue")
+
+# ---------------------------------------------------------------- palette
+# Bolt blue matches the app icon / installer / marketing so the brand feels
+# consistent across every surface the user sees.
+COLOR = {
+    "bg":          "#F4F7FC",   # window background - soft blue-white, not stark #fff
+    "card":        "#FFFFFF",   # elevated panels (settings box, drop zone)
+    "card_border": "#E4E9F2",   # hairline border on cards, mimics a glass edge
+    "ink":         "#182233",   # primary text
+    "ink_soft":    "#5B6B82",   # secondary / helper text
+    "bolt":        "#2F7CF6",   # primary accent (buttons, focus, links)
+    "bolt_hover":  "#1E5FD0",
+    "bolt_soft":   "#EAF1FF",   # tint backgrounds (badges, hover states)
+    "green":       "#1FA75C",
+    "red":         "#E0475B",
+    "track":       "#E4E9F2",   # progress bar track / slider track
+}
+
+FONT_FAMILY = "Segoe UI"   # ships with every Windows install - no bundling needed
+
+
+def F(size: int, weight: str = "normal") -> ctk.CTkFont:
+    return ctk.CTkFont(family=FONT_FAMILY, size=size, weight=weight)
+
+
+class _Root(ctk.CTk):
+    """CustomTkinter window that also accepts dropped files.
+    (tkinterdnd2 needs to hook the Tk instance at creation - this mixes both.)"""
+    def __init__(self):
+        super().__init__()
+        self.configure(fg_color=COLOR["bg"])
+        if DND_OK:
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                self._dnd_ready = True
+            except Exception as e:
+                print(f"[GUI] drag-drop unavailable: {e}")
+                self._dnd_ready = False
+        else:
+            self._dnd_ready = False
+
+
+def _parse_dropped(data: str) -> list[str]:
+    """Tk hands dropped paths as one string; paths with spaces come in {braces}."""
+    out, buf, in_brace = [], "", False
+    for ch in data:
+        if ch == "{":
+            in_brace, buf = True, ""
+        elif ch == "}":
+            in_brace = False
+            out.append(buf); buf = ""
+        elif ch == " " and not in_brace:
+            if buf:
+                out.append(buf); buf = ""
+        else:
+            buf += ch
+    if buf:
+        out.append(buf)
+    return [p for p in out if p]
+
+
+class SnapshrinkApp:
+    def __init__(self, files: list[str] | None = None):
+        self.cfg = cfgmod.load()
+        self.files: list[str] = []
+        self.events: queue.Queue = queue.Queue()
+        self.running = False
+
+        self.root = _Root()
+        self.root.title("Snapshrink")
+        self.root.geometry("680x720")
+        self.root.minsize(600, 660)
+        self._build()
+
+        if files:
+            self.add_files(files)
+
+        self.root.after(80, self._drain_events)
+
+    # ------------------------------------------------------------ layout
+    def _build(self):
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=1)
+
+        # ---- header: bolt mark + wordmark ----
+        header = ctk.CTkFrame(self.root, fg_color="transparent")
+        header.grid(row=0, column=0, pady=(22, 6), sticky="n")
+        ctk.CTkLabel(header, text="⚡", font=F(22),
+                     text_color=COLOR["bolt"]).pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(header, text="Snapshrink", font=F(24, "bold"),
+                     text_color=COLOR["ink"]).pack(side="left")
+
+        # ---- drop zone / file list (elevated white card) ----
+        drop = ctk.CTkFrame(self.root, corner_radius=16, fg_color=COLOR["card"],
+                            border_width=1, border_color=COLOR["card_border"])
+        drop.grid(row=1, column=0, padx=20, pady=14, sticky="nsew")
+        drop.grid_columnconfigure(0, weight=1)
+        drop.grid_rowconfigure(0, weight=1)
+
+        self.filebox = ctk.CTkTextbox(
+            drop, activate_scrollbars=True, corner_radius=12,
+            fg_color=COLOR["bolt_soft"], text_color=COLOR["ink_soft"],
+            font=F(13), border_width=0,
+        )
+        self.filebox.grid(row=0, column=0, padx=14, pady=14, sticky="nsew")
+        self.filebox.configure(state="disabled")
+
+        btnrow = ctk.CTkFrame(drop, fg_color="transparent")
+        btnrow.grid(row=1, column=0, pady=(0, 14))
+        self._btn(btnrow, "Add files...", self.browse, width=120,
+                  style="outline").pack(side="left", padx=4)
+        self._btn(btnrow, "Clear", self.clear, width=90,
+                  style="ghost").pack(side="left", padx=4)
+
+        if self.root._dnd_ready:
+            self.filebox.drop_target_register(DND_FILES)
+            self.filebox.dnd_bind("<<Drop>>", self._on_drop)
+
+        # ---- settings card ----
+        s = ctk.CTkFrame(self.root, corner_radius=16, fg_color=COLOR["card"],
+                         border_width=1, border_color=COLOR["card_border"])
+        s.grid(row=2, column=0, padx=20, pady=(0, 10), sticky="ew")
+        for c in (1, 3):
+            s.grid_columnconfigure(c, weight=1)
+        PAD = dict(padx=(16, 6), pady=10)
+
+        self._label(s, "Format").grid(row=0, column=0, sticky="w", **PAD)
+        self.v_fmt = ctk.StringVar(value=self.cfg["out_format"])
+        ctk.CTkOptionMenu(s, values=list(OUTPUT_FORMATS), variable=self.v_fmt,
+                          width=100, fg_color=COLOR["bolt"],
+                          button_color=COLOR["bolt_hover"],
+                          button_hover_color=COLOR["bolt_hover"],
+                          dropdown_fg_color=COLOR["card"],
+                          dropdown_text_color=COLOR["ink"],
+                          font=F(13), corner_radius=8
+                          ).grid(row=0, column=1, sticky="w", pady=10)
+
+        self._label(s, "Quality").grid(row=0, column=2, sticky="w", padx=(16, 6))
+        self.v_q = ctk.IntVar(value=self.cfg["quality"])
+        self.lbl_q = ctk.CTkLabel(s, text=str(self.cfg["quality"]), width=28,
+                                  font=F(13, "bold"), text_color=COLOR["bolt"])
+        self.lbl_q.grid(row=0, column=4, padx=(4, 16))
+        ctk.CTkSlider(s, from_=60, to=95, number_of_steps=35, variable=self.v_q,
+                      progress_color=COLOR["bolt"], button_color=COLOR["bolt"],
+                      button_hover_color=COLOR["bolt_hover"], fg_color=COLOR["track"],
+                      command=lambda v: self.lbl_q.configure(text=str(int(float(v))))
+                      ).grid(row=0, column=3, sticky="ew", pady=10)
+
+        self._label(s, "Max size (KB)").grid(row=1, column=0, sticky="w", **PAD)
+        self.v_kb = ctk.StringVar(value=str(self.cfg["target_kb"] or ""))
+        self._entry(s, self.v_kb, "e.g. 250", 100).grid(row=1, column=1, sticky="w")
+
+        self._label(s, "Max edge (px)").grid(row=1, column=2, sticky="w", padx=(16, 6))
+        self.v_px = ctk.StringVar(value=str(self.cfg["target_px"] or ""))
+        self._entry(s, self.v_px, "e.g. 1920", 100).grid(row=1, column=3, sticky="w")
+
+        self.v_exif = ctk.BooleanVar(value=self.cfg["strip_exif"])
+        ctk.CTkCheckBox(s, text="Remove EXIF / GPS metadata",
+                        variable=self.v_exif, font=F(13),
+                        text_color=COLOR["ink"], fg_color=COLOR["bolt"],
+                        hover_color=COLOR["bolt_hover"], border_color=COLOR["track"],
+                        checkmark_color="#FFFFFF"
+                        ).grid(row=2, column=0, columnspan=2,
+                               padx=16, pady=(2, 14), sticky="w")
+
+        self.v_out = ctk.StringVar(value=self.cfg["output_dir"] or "")
+        self._entry(s, self.v_out,
+                    "Output folder (blank = same folder as source)", None
+                    ).grid(row=3, column=0, columnspan=4, padx=16, pady=(0, 14), sticky="ew")
+        self._btn(s, "...", self.pick_out, width=38, style="outline"
+                  ).grid(row=3, column=4, padx=(0, 16), pady=(0, 14))
+
+        # ---- actions ----
+        a = ctk.CTkFrame(self.root, fg_color="transparent")
+        a.grid(row=3, column=0, padx=20, sticky="ew")
+        a.grid_columnconfigure(0, weight=1)
+
+        self.bar = ctk.CTkProgressBar(a, progress_color=COLOR["bolt"],
+                                      fg_color=COLOR["track"], corner_radius=6, height=8)
+        self.bar.set(0)
+        self.bar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(2, 10))
+
+        self.status = ctk.CTkLabel(a, text="Drop images above, or use Add files...",
+                                   anchor="w", justify="left",
+                                   font=F(13), text_color=COLOR["ink_soft"])
+        self.status.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+
+        self.btn_go = self._btn(a, "Convert", self.convert, height=46,
+                                font=F(16, "bold"), style="primary")
+        self.btn_go.grid(row=2, column=0, sticky="ew", pady=(0, 16))
+        self._btn(a, "Save as defaults", self.save_defaults, width=140,
+                  style="outline").grid(row=2, column=1, padx=(10, 0), pady=(0, 16))
+        self._btn(a, "About", self.show_about, width=76,
+                  style="ghost").grid(row=2, column=2, padx=(10, 0), pady=(0, 16))
+
+        note = "Originals are never modified." + ("" if self.root._dnd_ready
+               else "   (drag-drop off: pip install tkinterdnd2)")
+        ctk.CTkLabel(self.root, text=note, text_color=COLOR["ink_soft"],
+                     font=F(11)).grid(row=4, column=0, pady=(0, 12))
+
+    # ------------------------------------------------------------ theme helpers
+    def _label(self, parent, text):
+        return ctk.CTkLabel(parent, text=text, font=F(13),
+                            text_color=COLOR["ink_soft"])
+
+    def _entry(self, parent, var, placeholder, width):
+        kw = dict(textvariable=var, placeholder_text=placeholder,
+                  fg_color=COLOR["bolt_soft"], border_color=COLOR["card_border"],
+                  text_color=COLOR["ink"], placeholder_text_color=COLOR["ink_soft"],
+                  font=F(13), corner_radius=8, border_width=1)
+        if width:
+            kw["width"] = width
+        return ctk.CTkEntry(parent, **kw)
+
+    def _btn(self, parent, text, command, width=None, height=32,
+             font=None, style="primary"):
+        """style: primary (solid blue) | outline (blue border) | ghost (soft grey)"""
+        kw = dict(text=text, command=command, corner_radius=10,
+                  font=font or F(13, "bold"))
+        if width:
+            kw["width"] = width
+        if height:
+            kw["height"] = height
+        if style == "primary":
+            kw.update(fg_color=COLOR["bolt"], hover_color=COLOR["bolt_hover"],
+                      text_color="#FFFFFF")
+        elif style == "outline":
+            kw.update(fg_color="transparent", hover_color=COLOR["bolt_soft"],
+                      text_color=COLOR["bolt"], border_width=1,
+                      border_color=COLOR["bolt"])
+        else:  # ghost
+            kw.update(fg_color=COLOR["bolt_soft"], hover_color=COLOR["card_border"],
+                      text_color=COLOR["ink_soft"])
+        return ctk.CTkButton(parent, **kw)
+
+    def show_about(self):
+        """Small modal-ish popup with credit, links, license, version."""
+        from .__init__ import __version__
+
+        top = ctk.CTkToplevel(self.root, fg_color=COLOR["bg"])
+        top.title("About Snapshrink")
+        top.geometry("440x480")
+        top.resizable(False, False)
+        top.transient(self.root)
+        # Small delay before grab_set: on Windows, grabbing before the window
+        # is fully mapped throws a Tk error.
+        top.after(100, lambda: top.grab_set())
+
+        # Center over the parent window
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 440) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 480) // 2
+        top.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        wrap = ctk.CTkFrame(top, corner_radius=0, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=30, pady=28)
+
+        ctk.CTkLabel(wrap, text="⚡", font=F(30),
+                     text_color=COLOR["bolt"]).pack(pady=(0, 4))
+        ctk.CTkLabel(wrap, text="Snapshrink", font=F(26, "bold"),
+                     text_color=COLOR["ink"]).pack(pady=(0, 2))
+        ctk.CTkLabel(wrap, text=f"v{__version__}", font=F(12),
+                     text_color=COLOR["ink_soft"]).pack(pady=(0, 20))
+
+        ctk.CTkLabel(wrap, text="Developed by", font=F(12),
+                     text_color=COLOR["ink_soft"]).pack(pady=(0, 4))
+        ctk.CTkLabel(wrap, text="VIJAY PARMAR", font=F(22, "bold"),
+                     text_color=COLOR["ink"]).pack(pady=(0, 20))
+
+        # Badges: open source, free forever
+        badges = ctk.CTkFrame(wrap, fg_color="transparent")
+        badges.pack(pady=(0, 24))
+        for text in ("Open Source", "Free Forever"):
+            ctk.CTkLabel(badges, text=text, font=F(12, "bold"),
+                         fg_color=COLOR["bolt_soft"], text_color=COLOR["bolt_hover"],
+                         corner_radius=100, padx=14, pady=6,
+                         ).pack(side="left", padx=6)
+
+        # Links
+        import webbrowser
+        LINKS = [
+            ("GitHub Repository", "https://github.com/thevijayparmar/snapshrink"),
+            ("LinkedIn", "https://www.linkedin.com/in/thevijayparmar/"),
+        ]
+        for label, url in LINKS:
+            self._btn(wrap, label, lambda u=url: webbrowser.open(u),
+                      width=280, height=36, font=F(13, "bold"),
+                      style="outline").pack(pady=5)
+
+        self._btn(wrap, "Close", top.destroy, width=100, height=34,
+                  style="ghost").pack(pady=(22, 0))
+
+    # ------------------------------------------------------------ files
+    def _on_drop(self, event):
+        self.add_files(_parse_dropped(event.data))
+
+    def add_files(self, paths: list[str]):
+        added = skipped = 0
+        for p in paths:
+            f = Path(p)
+            if f.is_dir():                        # dropped a folder: take images inside
+                for child in sorted(f.iterdir()):
+                    if child.suffix.lower() in SUPPORTED_INPUT_EXT and str(child) not in self.files:
+                        self.files.append(str(child)); added += 1
+                continue
+            if f.suffix.lower() not in SUPPORTED_INPUT_EXT:
+                skipped += 1; continue
+            if str(f) not in self.files:
+                self.files.append(str(f)); added += 1
+        self._refresh_list()
+        msg = f"{len(self.files)} file(s) queued."
+        if skipped:
+            msg += f"  ({skipped} unsupported file(s) ignored)"
+        self.status.configure(text=msg)
+
+    def _refresh_list(self):
+        self.filebox.configure(state="normal")
+        self.filebox.delete("1.0", "end")
+        if not self.files:
+            self.filebox.insert("1.0",
+                                "\n\n        Drag and drop images here\n"
+                                "        (or a whole folder)\n")
+        else:
+            for i, f in enumerate(self.files, 1):
+                self.filebox.insert("end", f"{i:>3}.  {Path(f).name}\n")
+        self.filebox.configure(state="disabled")
+
+    def clear(self):
+        self.files.clear()
+        self._refresh_list()
+        self.bar.set(0)
+        self.status.configure(text="Queue cleared.")
+
+    def browse(self):
+        from tkinter import filedialog
+        exts = " ".join("*" + e for e in sorted(SUPPORTED_INPUT_EXT))
+        picked = filedialog.askopenfilenames(
+            title="Choose images", filetypes=[("Images", exts), ("All files", "*.*")])
+        if picked:
+            self.add_files(list(picked))
+
+    def pick_out(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Output folder")
+        if d:
+            self.v_out.set(d)
+
+    # ------------------------------------------------------------ settings
+    def _int_or_none(self, var, name) -> int | None:
+        raw = var.get().strip()
+        if not raw:
+            return None
+        if not raw.isdigit() or int(raw) <= 0:
+            raise ValueError(f"{name} must be a whole number greater than 0 (got '{raw}')")
+        return int(raw)
+
+    def _collect(self) -> dict:
+        return {
+            "out_format": self.v_fmt.get(),
+            "quality": int(self.v_q.get()),
+            "target_kb": self._int_or_none(self.v_kb, "Max size (KB)"),
+            "target_px": self._int_or_none(self.v_px, "Max edge (px)"),
+            "strip_exif": bool(self.v_exif.get()),
+            "output_dir": self.v_out.get().strip() or None,
+        }
+
+    def save_defaults(self):
+        try:
+            self.cfg.update(self._collect())
+        except ValueError as e:
+            self.status.configure(text=f"Can't save: {e}"); return
+        ok = cfgmod.save(self.cfg)
+        self.status.configure(text="Settings saved as defaults."
+                              if ok else "Could not write config.json (see console).")
+
+    # ------------------------------------------------------------ convert
+    def convert(self):
+        if self.running:
+            return
+        if not self.files:
+            self.status.configure(text="Nothing queued - drop some images first.")
+            return
+        try:
+            opts = Options(**self._collect())
+        except ValueError as e:
+            self.status.configure(text=str(e)); return
+
+        self.running = True
+        self.btn_go.configure(state="disabled", text="Working...")
+        self.bar.set(0)
+        threading.Thread(target=self._worker, args=(list(self.files), opts),
+                         daemon=True).start()
+
+    def _worker(self, files, opts):
+        # runs off the UI thread; results are posted back through a queue
+        def progress(done, total, r):
+            self.events.put(("progress", done, total, r))
+        results = process_batch(files, opts, progress=progress)
+        self.events.put(("done", results))
+
+    def _drain_events(self):
+        try:
+            while True:
+                ev = self.events.get_nowait()
+                if ev[0] == "progress":
+                    _, done, total, r = ev
+                    self.bar.set(done / total)
+                    self.status.configure(text=f"[{done}/{total}] {r.summary()}")
+                elif ev[0] == "done":
+                    self._finish(ev[1])
+        except queue.Empty:
+            pass
+        self.root.after(80, self._drain_events)
+
+    def _finish(self, results):
+        self.running = False
+        self.btn_go.configure(state="normal", text="Convert")
+        self.bar.set(1)
+        ok = [r for r in results if r.ok]
+        bad = [r for r in results if not r.ok]
+        tin = sum(r.in_bytes for r in ok)
+        tout = sum(r.out_bytes for r in ok)
+        msg = f"Done: {len(ok)} converted"
+        if bad:
+            msg += f", {len(bad)} failed ({Path(bad[0].source).name}: {bad[0].error})"
+        if ok and tin:
+            msg += f"\n{tin/1024:.0f} KB -> {tout/1024:.0f} KB  ({(1-tout/tin)*100:.0f}% saved)"
+        self.status.configure(text=msg)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def launch(files: list[str] | None = None):
+    SnapshrinkApp(files).run()
